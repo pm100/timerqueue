@@ -18,8 +18,8 @@ pub struct TimerQueue {
 pub trait TQDispatch {
     fn execute(&self, payload: Payload);
 }
-type DispWrap = Arc<Mutex<dyn TQDispatch + Send>>;
-type Payload = Box<dyn Any + Send>;
+pub type DispWrap = Arc<dyn TQDispatch + Send +Sync>;
+pub type Payload = Box<dyn Any + Send>;
 
 struct TimerQueueItem {
     when: Instant,  // when it should run
@@ -175,7 +175,7 @@ impl TimerQueue {
                     } else {
                         trace!(target:"TimerQueue","running {0}", tqi.name);
                         let pl = tqi.data;
-                        tqi.what.lock().unwrap().execute(pl);
+                        tqi.what.execute(pl);
                         tqi.handle.signal();
                         // queue.pop().unwrap();
                     }
@@ -248,11 +248,12 @@ mod tests {
     #[test]
     fn it_works() {
         env_logger::init();
-        let o1 = Arc::new(Mutex::new(TestObj {
-        }));
+        let o1 = Arc::new(TestObj {
+        });
 
-        let o2 = Arc::new(Mutex::new(TestObj {
-        }));
+        let o2 = Arc::new(TestObj {
+        }
+    );
         let tq = TimerQueue::new();
         tq.queue(
             o1.clone() as DispWrap,
