@@ -1,5 +1,4 @@
 use log::trace;
-use std::any::*;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::sync::mpsc;
@@ -15,50 +14,60 @@ pub struct TimerQueue {
     tx: Sender<QueueInstruction>,
 }
 
-pub trait TQDispatch {
-    fn execute(&self, payload: Payload);
-}
-pub type DispWrap = Arc<dyn TQDispatch + Send +Sync>;
-pub type Payload = Box<dyn Any + Send>;
-
+pub type TQIFunc = Box<dyn Fn() -> () + Send + Sync>;
 struct TimerQueueItem {
-    when: Instant,  // when it should run
-    name: String,   // for trace only
-    what: DispWrap, // what to run
-    data: Payload,  // args to pass
+    when: Instant, // when it should run
+    name: String,  // for trace only
+    what: TQIFunc, // what to run
     handle: TimerQueueHandle,
 }
 
 #[derive(Clone, Debug)]
 pub struct TimerQueueHandle {
-    handle: Arc<(Mutex<bool>, Condvar)>,
+    handle: Arc<(Mutex<TQHState>, Condvar)>,
 }
-
+#[derive(Debug,Clone,PartialEq)]
+enum TQHState{
+    NotValid,
+    WaitingToRun,
+    Running,
+    Finished,
+    Final
+}
 impl TimerQueueHandle {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
-            handle: Arc::new((Mutex::new(false), Condvar::new())),
+            handle: Arc::new((Mutex::new(TQHState::NotValid), Condvar::new())),
         }
     }
 
-    pub fn wait(&self) {
-        let (lock, cv) = &*self.handle;
-        let mut finished = lock.lock().unwrap();
-        while !*finished {
-            finished = cv.wait(finished).unwrap();
-        }
-    }
-    pub fn finished(&self) -> bool {
+    pub fn is_valid(&self) -> bool{
         let (lock, _cv) = &*self.handle;
-        let finished = lock.lock().unwrap();
-        *finished
+        let state = lock.lock().unwrap();
+        *state != TQHState::NotValid 
     }
-    fn signal(&self) {
+    pub fn wait(& self) {
         let (lock, cv) = &*self.handle;
-        let mut finished = lock.lock().unwrap();
-        *finished = true;
+        let mut state = lock.lock().unwrap();
+        assert!(*state != TQHState::NotValid && *state != TQHState::Final);
+        while *state != TQHState::Finished {
+            state = cv.wait(state).unwrap();
+        }
+        *state = TQHState::Final;
+    }
+    pub fn finished(& self) -> bool {
+        let (lock, _cv) = &*self.handle;
+        let  state = lock.lock().unwrap();
+        assert!(*state != TQHState::NotValid);
+        let finished = *state == TQHState::Finished || *state == TQHState::Final;
+      
+        finished
+    }
+    fn signal(&self, new_state:TQHState) {
+        let (lock, cv) = &*self.handle;
+        let mut state = lock.lock().unwrap();
+        *state = new_state;
         cv.notify_all();
-        // unsafe{std::intrinsics::breakpoint()};
     }
 }
 
@@ -174,9 +183,9 @@ impl TimerQueue {
                         }
                     } else {
                         trace!(target:"TimerQueue","running {0}", tqi.name);
-                        let pl = tqi.data;
-                        tqi.what.execute(pl);
-                        tqi.handle.signal();
+                        tqi.handle.signal(TQHState::Running);
+                        (tqi.what)();
+                        tqi.handle.signal(TQHState::Finished);
                         // queue.pop().unwrap();
                     }
                 }
@@ -187,7 +196,7 @@ impl TimerQueue {
         TimerQueue { jh: Some(jh), tx }
     }
 
-    pub fn queue(&self, f: DispWrap, data: Payload, n: String, when: Instant) -> TimerQueueHandle {
+    pub fn queue(&self, f: TQIFunc,  n: String, when: Instant) -> TimerQueueHandle {
         let handle = TimerQueueHandle::new();
         trace!(target:"TimerQueue", "queued {0}", &n);
         let qi = TimerQueueItem {
@@ -195,10 +204,10 @@ impl TimerQueue {
             name: n,
             when: when,
             handle: handle.clone(),
-            data,
         };
         let qinst = QueueInstruction::Do(qi);
         self.tx.send(qinst).unwrap();
+        handle.signal(TQHState::WaitingToRun);
         handle
     }
 }
@@ -215,79 +224,54 @@ impl Drop for TimerQueue {
 #[cfg(test)]
 mod tests {
     use crate::*;
-    struct TestObj {
-       // foo: u32,
-       // s: String,
-    }
-    enum Ops {
-        F1(u32),
-        F2(String),
-    }
+
+    struct TestObj{}
 
     impl TestObj {
-        pub fn f1(&self, u: &u32) {
+        pub fn f1(&self, u: u32) {
             println!("{}", u);
         }
-        pub fn f2(&self, s: &String) {
+        pub fn f2(&self, s: String) {
             println!("{}", s);
         }
     }
 
-    impl crate::TQDispatch for TestObj {
-        fn execute(&self, payload: Box<dyn Any + Send>) {
-            if let Some(pl) = payload.downcast_ref::<Ops>() {
-                match pl {
-                    Ops::F1(u) => self.f1(u),
-                    Ops::F2(s) => self.f2(s),
-                }
-            } else {
-                unreachable!();
-            }
-        }
-    }
     #[test]
     fn it_works() {
         env_logger::init();
-        let o1 = Arc::new(TestObj {
-        });
-
-        let o2 = Arc::new(TestObj {
-        }
-    );
+        let o1 = Arc::new(TestObj {});
+        let o2 = Arc::new(TestObj {});
         let tq = TimerQueue::new();
+        let oc1 = o1.clone();
         tq.queue(
-            o1.clone() as DispWrap,
-            Box::new(Ops::F1(1)),
+            Box::new(move || oc1.f1(1)),
             String::from("1 sec"),
             Instant::now() + Duration::from_millis(1000),
         );
+        let oc2 = o2.clone();
+
         let h5 = tq.queue(
-            o2.clone() as DispWrap,
-            Box::new(Ops::F2("test 5".to_string())),
+            Box::new(move || oc2.f2("5".to_string())),
             String::from("5 sec"),
             Instant::now() + Duration::from_millis(5000),
         );
-
+        let oc2 = o2.clone();
         tq.queue(
-            o2.clone() as DispWrap,
-            Box::new(Ops::F1(2)),
+            Box::new(move || oc2.f1(2)),
             String::from("2 sec"),
             Instant::now() + Duration::from_millis(2000),
         );
-
+        let oc1 = o1.clone();
         let h3 = tq.queue(
-            o1.clone() as DispWrap,
-            Box::new(Ops::F2("test 3".to_string())),
+            Box::new(move || oc1.f2("3".to_string())),
             String::from("3 sec"),
             Instant::now() + Duration::from_millis(3000),
         );
 
         h3.wait();
         println!("h3 done");
-        println!("h5 is finised {}", h5.finished());
+        println!("h5 is finished {}", h5.finished());
         h5.wait();
-        println!("h5 is finised {}", h5.finished());
+        println!("h5 is finished {}", h5.finished());
     }
-
-
 }
