@@ -14,7 +14,13 @@ pub struct TimerQueue {
     tx: Sender<QueueInstruction>,
 }
 
-pub type TQIFunc = Box<dyn Fn() -> () + Send + Sync>;
+impl Default for TimerQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub type TQIFunc = Box<dyn Fn() + Send + Sync>;
 struct TimerQueueItem {
     when: Instant, // when it should run
     name: String,  // for trace only
@@ -26,14 +32,20 @@ struct TimerQueueItem {
 pub struct TimerQueueHandle {
     handle: Arc<(Mutex<TQHState>, Condvar)>,
 }
-#[derive(Debug,Clone,PartialEq)]
-enum TQHState{
+#[derive(Debug, Clone, PartialEq)]
+enum TQHState {
     NotValid,
     WaitingToRun,
     Running,
     Finished,
-    Final
+    Final,
 }
+impl Default for TimerQueueHandle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TimerQueueHandle {
     pub fn new() -> Self {
         Self {
@@ -41,12 +53,12 @@ impl TimerQueueHandle {
         }
     }
 
-    pub fn is_valid(&self) -> bool{
+    pub fn is_valid(&self) -> bool {
         let (lock, _cv) = &*self.handle;
         let state = lock.lock().unwrap();
-        *state != TQHState::NotValid 
+        *state != TQHState::NotValid
     }
-    pub fn wait(& self) {
+    pub fn wait(&self) {
         let (lock, cv) = &*self.handle;
         let mut state = lock.lock().unwrap();
         assert!(*state != TQHState::NotValid && *state != TQHState::Final);
@@ -55,15 +67,13 @@ impl TimerQueueHandle {
         }
         *state = TQHState::Final;
     }
-    pub fn finished(& self) -> bool {
+    pub fn finished(&self) -> bool {
         let (lock, _cv) = &*self.handle;
-        let  state = lock.lock().unwrap();
+        let state = lock.lock().unwrap();
         assert!(*state != TQHState::NotValid);
-        let finished = *state == TQHState::Finished || *state == TQHState::Final;
-      
-        finished
+        *state == TQHState::Finished || *state == TQHState::Final
     }
-    fn signal(&self, new_state:TQHState) {
+    fn signal(&self, new_state: TQHState) {
         let (lock, cv) = &*self.handle;
         let mut state = lock.lock().unwrap();
         *state = new_state;
@@ -148,7 +158,7 @@ impl TimerQueue {
             let mut queue: BinaryHeap<TimerQueueItem> = BinaryHeap::new();
             let mut stop = false;
             loop {
-                if queue.len() == 0 {
+                if queue.is_empty() {
                     if stop {
                         break;
                     }
@@ -196,13 +206,13 @@ impl TimerQueue {
         TimerQueue { jh: Some(jh), tx }
     }
 
-    pub fn queue(&self, f: TQIFunc,  n: String, when: Instant) -> TimerQueueHandle {
+    pub fn queue(&self, f: TQIFunc, n: String, when: Instant) -> TimerQueueHandle {
         let handle = TimerQueueHandle::new();
         trace!(target:"TimerQueue", "queued {0}", &n);
         let qi = TimerQueueItem {
             what: f,
             name: n,
-            when: when,
+            when,
             handle: handle.clone(),
         };
         let qinst = QueueInstruction::Do(qi);
@@ -215,9 +225,8 @@ impl TimerQueue {
 impl Drop for TimerQueue {
     fn drop(&mut self) {
         self.tx.send(QueueInstruction::Stop).unwrap();
-        match self.jh.take() {
-            Some(jh) => jh.join().unwrap(),
-            None => {}
+        if let Some(jh) = self.jh.take() {
+            jh.join().unwrap()
         }
     }
 }
@@ -225,7 +234,7 @@ impl Drop for TimerQueue {
 mod tests {
     use crate::*;
 
-    struct TestObj{}
+    struct TestObj {}
 
     impl TestObj {
         pub fn f1(&self, u: u32) {
